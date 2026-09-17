@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { open, readFile, unlink, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { WebSocket } from "ws";
 
@@ -8,8 +9,38 @@ const port = Number(process.env.PORT ?? 4320);
 const cdpPort = Number(process.env.CHROME_CDP_PORT ?? 9222);
 const chromeShareOrigin = process.env.CHROME_SHARE_ORIGIN ?? "http://localhost:5173";
 const cdpRequestTimeoutMs = 5000;
+const lockPath = `${tmpdir()}\\ChromeHelper-${port}.lock`;
+let launchInFlight: Promise<void> | null = null;
+let lockHandle: FileHandle | null = null;
+let shuttingDown = false;
 
 class InvalidRequestError extends Error {}
+
+async function acquireProcessLock() {
+  try {
+    lockHandle = await open(lockPath, "wx");
+    await lockHandle.writeFile(String(process.pid));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    try {
+      const ownerPid = Number((await readFile(lockPath, "utf8")).trim());
+      process.kill(ownerPid, 0);
+      throw new Error(`ChromeHelper is already running (PID ${ownerPid}, port ${port})`);
+    } catch (ownerError) {
+      if (ownerError instanceof Error && ownerError.message.startsWith("ChromeHelper is already running")) throw ownerError;
+      await unlink(lockPath).catch(() => undefined);
+      lockHandle = await open(lockPath, "wx");
+      await lockHandle.writeFile(String(process.pid));
+    }
+  }
+}
+
+async function releaseProcessLock() {
+  if (!lockHandle) return;
+  await lockHandle?.close().catch(() => undefined);
+  lockHandle = null;
+  await unlink(lockPath).catch(() => undefined);
+}
 
 interface ChromeTab {
   id: string;
@@ -114,14 +145,28 @@ async function findTab(tabId: string) {
   return tab;
 }
 
+async function isChromeConnected() {
+  try {
+    await chromeRequest<ChromeTab[]>("/json/list");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function launchChrome() {
+  if (await isChromeConnected()) return { started: false, alreadyRunning: true };
+  if (launchInFlight) {
+    await launchInFlight;
+    return { started: false, alreadyRunning: true };
+  }
   const chromeCandidates = [
     `${process.env.PROGRAMFILES ?? "C:\\Program Files"}\\Google\\Chrome\\Application\\chrome.exe`,
     `${process.env.LOCALAPPDATA ?? ""}\\Google\\Chrome\\Application\\chrome.exe`
   ];
   const executable = chromeCandidates.find((candidate) => candidate && existsSync(candidate));
   if (!executable) throw new Error("Chrome executable was not found");
-  await new Promise<void>((resolve, reject) => {
+  launchInFlight = new Promise<void>((resolve, reject) => {
     const child = spawn(executable, [
       `--remote-debugging-port=${cdpPort}`,
       "--remote-allow-origins=http://localhost:4320",
@@ -134,6 +179,12 @@ async function launchChrome() {
       resolve();
     });
   });
+  try {
+    await launchInFlight;
+  } finally {
+    launchInFlight = null;
+  }
+  return { started: true, alreadyRunning: false };
 }
 
 async function readBody(request: import("node:http").IncomingMessage) {
@@ -170,10 +221,16 @@ const server = createServer(async (request, response) => {
       response.end(JSON.stringify(tabs));
       return;
     }
+    if (request.method === "GET" && request.url === "/api/chrome/status") {
+      const connected = await isChromeConnected();
+      response.writeHead(200);
+      response.end(JSON.stringify({ connected, cdpPort, mode: "local-bridge" }));
+      return;
+    }
     if (request.method === "POST" && request.url === "/api/chrome/launch") {
-      await launchChrome();
+      const launch = await launchChrome();
       response.writeHead(202);
-      response.end(JSON.stringify({ started: true, cdpPort }));
+      response.end(JSON.stringify({ ...launch, cdpPort }));
       return;
     }
 
@@ -220,6 +277,30 @@ const server = createServer(async (request, response) => {
   }
 });
 
-server.listen(port, "127.0.0.1", () => {
-  console.log(`Chrome Helper listening on http://127.0.0.1:${port}`);
+async function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`Chrome Helper shutting down (${signal})`);
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  await releaseProcessLock();
+}
+
+async function startServer() {
+  await acquireProcessLock();
+  server.on("error", async (error) => {
+    console.error(error);
+    await releaseProcessLock();
+    process.exitCode = 1;
+  });
+  server.listen(port, "127.0.0.1", () => {
+    console.log(`Chrome Helper listening on http://127.0.0.1:${port}`);
+  });
+}
+
+process.once("SIGINT", () => { void shutdown("SIGINT"); });
+process.once("SIGTERM", () => { void shutdown("SIGTERM"); });
+void startServer().catch(async (error) => {
+  console.error(error);
+  await releaseProcessLock();
+  process.exitCode = 1;
 });

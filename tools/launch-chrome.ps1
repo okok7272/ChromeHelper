@@ -1,3 +1,12 @@
+$cdpUrl = 'http://127.0.0.1:9222/json/version'
+try {
+  Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 $cdpUrl | Out-Null
+  Write-Output 'ChromeHelper Chrome is already running with local debugging on port 9222.'
+  exit 0
+} catch {
+  # Chrome CDP is not available yet; start the dedicated profile below.
+}
+
 $chrome = Join-Path ${env:ProgramFiles} 'Google\Chrome\Application\chrome.exe'
 if (-not (Test-Path $chrome)) {
   $chrome = Join-Path ${env:LOCALAPPDATA} 'Google\Chrome\Application\chrome.exe'

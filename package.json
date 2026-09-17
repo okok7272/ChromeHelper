@@ -6,13 +6,20 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "start": "node dist/src/server.js",
+    "start:standalone": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/start-standalone.ps1",
+    "package:win": "npm.cmd run build && pkg dist/src/server.js --targets node24-win-x64 --output dist/ChromeHelper.exe",
+    "startup:install": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/install-startup.ps1",
+    "startup:remove": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/uninstall-startup.ps1",
     "build": "tsc -b",
-    "typecheck": "tsc -b --pretty false"
+    "typecheck": "tsc -b --pretty false",
+    "test": "tsx --test tests/server.test.ts",
+    "smoke": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/smoke-test.ps1"
   },
   "dependencies": {
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@yao-pkg/pkg": "^6.10.1",
     "@types/node": "^22.10.2",
     "@types/ws": "^8.5.13",
     "tsx": "^4.19.2",
